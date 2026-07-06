@@ -98,29 +98,70 @@ class WifiManager: CommProtocol {
          }
         let logger = self.logger // Avoid capturing `self` directly
 
+        // ELM327 terminates every response with a '>' prompt. A single receive() returns
+        // after the FIRST TCP segment, which on many WiFi clones contains only the command
+        // echo — the actual payload (and the "OK" the init sequence looks for) arrives in
+        // subsequent segments. Accumulate until the prompt shows up (or a deadline passes),
+        // otherwise responses interleave: each read returns the previous command's tail.
         return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+            var resumed = false
+            var buffer = ""
+            let deadline = DispatchTime.now() + .seconds(5)
+
+            func resumeOnce(_ result: Result<String, Error>) {
+                guard !resumed else { return }
+                resumed = true
+                switch result {
+                case .success(let value): continuation.resume(returning: value)
+                case .failure(let error): continuation.resume(throwing: error)
+                }
+            }
+
+            // Overall deadline: a clone that never sends '>' shouldn't hang the caller.
+            // Connection runs on the main queue (see connectAsync), so this and the
+            // receive callbacks are serialized — the plain `resumed` flag is safe.
+            DispatchQueue.main.asyncAfter(deadline: deadline) {
+                if buffer.isEmpty {
+                    logger.warning("Receive timed out with no data")
+                    resumeOnce(.failure(CommunicationError.invalidData))
+                } else {
+                    logger.warning("Receive timed out without '>' prompt, returning partial buffer")
+                    resumeOnce(.success(buffer))
+                }
+            }
+
+            func receiveChunk() {
+                tcpConnection.receive(minimumIncompleteLength: 1, maximumLength: 500) { data, _, isComplete, error in
+                    if let error = error {
+                        logger.error("Error receiving data: \(error.localizedDescription)")
+                        resumeOnce(.failure(CommunicationError.errorOccurred(error)))
+                        return
+                    }
+                    if let data, let chunk = String(data: data, encoding: .utf8) {
+                        buffer += chunk
+                    }
+                    if buffer.contains(">") {
+                        resumeOnce(.success(buffer))
+                    } else if isComplete {
+                        // Peer closed the connection — return whatever arrived.
+                        if buffer.isEmpty {
+                            resumeOnce(.failure(CommunicationError.invalidData))
+                        } else {
+                            resumeOnce(.success(buffer))
+                        }
+                    } else if !resumed {
+                        receiveChunk()
+                    }
+                }
+            }
+
             tcpConnection.send(content: data, completion: .contentProcessed { error in
                 if let error = error {
                     logger.error("Error sending data: \(error.localizedDescription)")
-                    continuation.resume(throwing: CommunicationError.errorOccurred(error))
+                    resumeOnce(.failure(CommunicationError.errorOccurred(error)))
                     return
                 }
-
-                tcpConnection.receive(minimumIncompleteLength: 1, maximumLength: 500) { data, _, _, error in
-                    if let error = error {
-                        logger.error("Error receiving data: \(error.localizedDescription)")
-                        continuation.resume(throwing: CommunicationError.errorOccurred(error))
-                        return
-                    }
-
-                    guard let response = data, let responseString = String(data: response, encoding: .utf8) else {
-                        logger.warning("Received invalid or empty data")
-                        continuation.resume(throwing: CommunicationError.invalidData)
-                        return
-                    }
-
-                    continuation.resume(returning: responseString)
-                }
+                receiveChunk()
             })
         }
     }
