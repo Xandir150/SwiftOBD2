@@ -386,9 +386,12 @@ class BLEManager: NSObject, CommProtocol, BLEPeripheralManagerDelegate {
                 obdDebug("Command response: \(response.joined(separator: " | "))", category: .communication)
                 return response
             } catch BLEManagerError.noData {
-                // "NO DATA" is the adapter's well-formed answer ("the vehicle didn't
-                // respond to this request"), not a comm failure — re-asking an
-                // unsupported PID 3 times would just burn the polling cycle's budget.
+                // NO DATA is a routine reply (module asleep, unsupported PID) — not a
+                // transport failure worth retrying (a parked car polling its ignition
+                // probe would otherwise burn the whole retry budget every cycle), and
+                // not worth logging above debug severity either — a real comm failure
+                // still gets a warning per attempt below.
+                obdDebug("No data: \(command)", category: .communication)
                 throw BLEManagerError.noData
             } catch {
                 lastError = error

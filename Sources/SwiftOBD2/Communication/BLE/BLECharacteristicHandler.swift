@@ -115,7 +115,9 @@ class BLECharacteristicHandler {
             throw BLEManagerError.missingPeripheralOrCharacteristic
         }
         peripheral.writeValue(data, for: characteristic, type: .withResponse)
-        logger.info("Sent command: \(command)")
+        // Routed through OBDLogger so the consuming app's log-level preference
+        // can silence this per-command line (a raw os.Logger call can't be gated).
+        obdDebug("Sent command: \(command)", category: .communication)
     }
 
     func handleUpdatedValue(_ data: Data, from characteristic: CBCharacteristic) {

@@ -378,7 +378,10 @@ class ELM327 {
         guard let statusData = preferredECUMessage(messages, pidEcho: 0x01)?.data else {
             return .failure(.noData)
         }
-        return statusCommand.properties.decode(data: statusData)
+        // message.data is [PID, A, B, C, D]; decode() no longer strips the PID
+        // byte, so drop it here (as sendCommand does) before StatusDecoder reads
+        // A as the MIL/DTC-count byte.
+        return statusCommand.properties.decode(data: statusData.dropFirst())
     }
 
     func scanForTroubleCodes() async throws -> [ECUID: [TroubleCode]] {
@@ -455,14 +458,19 @@ class ELM327 {
 
     private func parseUDS19Data(_ data: Data) -> [TroubleCode] {
         let bytes = Array(data)
-        // UDS $19/$02 response: 59 02 [status_mask] then 4-byte groups [b1 b2 b3 status]
+        // UDS $19/$02 response: 59 02 [status availability mask] then 4-byte
+        // records [b1 b2 b3 statusMask] — a 3-byte DTC plus its status byte.
         guard bytes.count >= 3, bytes[0] == 0x59, bytes[1] == 0x02 else { return [] }
         var result: [TroubleCode] = []
         var i = 3
         while i + 3 <= bytes.count {
-            let b1 = bytes[i], b2 = bytes[i + 1]
-            if (b1 != 0 || b2 != 0), let tc = parseDTC(Data([b1, b2])) {
-                result.append(tc)
+            let b1 = bytes[i], b2 = bytes[i + 1], b3 = bytes[i + 2]
+            // parseDTC builds the base P/C/B/U code from b1,b2 (and rejects 00 00).
+            if let base = parseDTC(Data([b1, b2])) {
+                // b3 is the ISO 14229 failure-type byte; append as "-XX" so distinct
+                // sub-faults of the same base code stay distinct.
+                let code = base.code + String(format: "-%02X", b3)
+                result.append(TroubleCode(code: code, description: base.description))
             }
             i += 4
         }

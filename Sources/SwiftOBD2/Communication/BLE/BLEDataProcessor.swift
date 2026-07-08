@@ -99,7 +99,9 @@ class BLEMessageProcessor {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        logger.debug("Parsed response: \(lines)")
+        // Routed through OBDLogger so the consuming app's log-level preference
+        // can silence this per-command line (a raw os.Logger call can't be gated).
+        obdDebug("Parsed response: \(lines)", category: .parsing)
         return lines
     }
 
