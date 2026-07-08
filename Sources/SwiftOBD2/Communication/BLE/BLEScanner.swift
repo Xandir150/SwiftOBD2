@@ -31,7 +31,10 @@ class BLEPeripheralScanner: ObservableObject {
         CBUUID(string: "18F0"), // e.g. VGate iCar Pro
     ]
 
-    private var foundPeripheralCompletion: ((CBPeripheral?, Error?) -> Void)?
+    // Resumed from the CB queue (discovery), reset() on an arbitrary thread
+    // (disconnect), or the cancellation handler — take-once so those racing
+    // paths can never double-resume the waiting continuation.
+    private let foundPeripheralCompletion = TakeOnceCompletion<CBPeripheral>()
 
     func addDiscoveredPeripheral(_ peripheral: CBPeripheral, advertisementData: [String: Any], rssi: NSNumber) {
         // Filter out peripherals with invalid RSSI
@@ -46,8 +49,7 @@ class BLEPeripheralScanner: ObservableObject {
         }
 
         // Complete waiting continuation if exists
-        foundPeripheralCompletion?(peripheral, nil)
-        foundPeripheralCompletion = nil // Clear after calling
+        foundPeripheralCompletion.take()?(peripheral, nil)
     }
 
     func waitForFirstPeripheral(timeout: TimeInterval) async throws -> CBPeripheral {
@@ -57,19 +59,36 @@ class BLEPeripheralScanner: ObservableObject {
         }
 
         // Otherwise wait for discovery
-        return try await withTimeout(seconds: timeout, timeoutError: BLEScannerError.scanTimeout) {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CBPeripheral, Error>) in
-                self.foundPeripheralCompletion = { peripheral, error in
-                    if let peripheral = peripheral {
-                        continuation.resume(returning: peripheral)
-                    } else if let error = error {
-                        continuation.resume(throwing: error)
-                    } else {
+        return try await withTimeout(seconds: timeout, timeoutError: BLEScannerError.scanTimeout) { [self] in
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CBPeripheral, Error>) in
+                    let claimed = foundPeripheralCompletion.set { peripheral, error in
+                        if let peripheral = peripheral {
+                            continuation.resume(returning: peripheral)
+                        } else if let error = error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume(throwing: BLEScannerError.peripheralNotFound)
+                        }
+                    }
+                    if !claimed {
                         continuation.resume(throwing: BLEScannerError.peripheralNotFound)
+                    } else if let first = foundPeripherals.first {
+                        // A discovery that landed between the early-return check
+                        // and set() found no waiter to resume — claim our own
+                        // slot rather than hanging until the timeout.
+                        foundPeripheralCompletion.take()?(first, nil)
                     }
                 }
+            } onCancel: { [self] in
+                foundPeripheralCompletion.take()?(nil, CancellationError())
             }
         }
+    }
+
+    func reset() {
+        foundPeripherals.removeAll()
+        foundPeripheralCompletion.take()?(nil, BLEScannerError.scanTimeout)
     }
 }
 // MARK: - CBPeripheralDelegate
@@ -103,7 +122,13 @@ func withTimeout<R>(
     onTimeout: (() -> Void)? = nil,
     operation: @escaping @Sendable () async throws -> R
 ) async throws -> R {
-    try await withThrowingTaskGroup(of: R.self) { group in
+    // .infinity = no deadline (pending-connect mode): run the operation bare —
+    // the nanosecond conversion below would trap on a non-finite value, and a
+    // timeout child that never fires is pointless.
+    guard seconds.isFinite else {
+        return try await operation()
+    }
+    return try await withThrowingTaskGroup(of: R.self) { group in
         group.addTask {
             let result = try await operation()
             try Task.checkCancellation()

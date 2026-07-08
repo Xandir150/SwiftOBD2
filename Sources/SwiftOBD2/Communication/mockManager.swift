@@ -42,8 +42,8 @@ class MOCKComm: CommProtocol {
                 header = "7E8"
             }
             for i in stride(from: 2, to: command.count, by: 2) {
-                let index = command.index(command.startIndex, offsetBy: i)
-                let nextIndex = command.index(command.startIndex, offsetBy: i + 2)
+                guard let index = command.index(command.startIndex, offsetBy: i, limitedBy: command.endIndex) else { break }
+                let nextIndex = command.index(index, offsetBy: 2, limitedBy: command.endIndex) ?? command.endIndex
                 let subCommand = prefix + String(command[index..<nextIndex])
                 guard let value = OBDCommand.mockResponse(forCommand: subCommand) else {
                     return ["No Data"]
@@ -68,7 +68,14 @@ class MOCKComm: CommProtocol {
                 Totallength += ffLength
 
                 var cf = Array(chunks.dropFirst())
-                Totallength += cf.joined().replacingOccurrences(of: " ", with: "").count
+                // Same hex-chars → bytes conversion as `ffLength` above (÷2) — this was
+                // adding raw hex-character count instead of byte count, roughly doubling
+                // the declared ISO-TP length. Harmless while `parser.swift`'s multi-frame
+                // assembly silently accepted a short/mismatched length, but this session's
+                // stricter bounds check there (`extractDataFromFrame` now throws instead of
+                // truncating) turned that inflated length into every multi-PID mock
+                // response failing to decode in the Simulator.
+                Totallength += cf.joined().replacingOccurrences(of: " ", with: "").count / 2
 
                 var lengthHex = String(format: "%02X", Totallength - 1)
 
@@ -179,6 +186,10 @@ class MOCKComm: CommProtocol {
         }
     }
 
+    func sendMonitorCommand(_ command: String, duration: TimeInterval) async throws -> [String] {
+        return []
+    }
+
     func disconnectPeripheral() {
         connectionState = .disconnected
         obdDelegate?.connectionStateChanged(state: .disconnected)
@@ -191,6 +202,10 @@ class MOCKComm: CommProtocol {
 
     func scanForPeripherals() async throws {
 
+    }
+
+    func reset() {
+        disconnectPeripheral()
     }
 }
 
@@ -338,6 +353,16 @@ extension OBDCommand {
                     let warmUp = Int.random(in: 0...40)
                     let hexWarmUp = String(format: "%02X", warmUp)
                     return "30" + " 00 00 " + hexWarmUp
+                case .timeSinceDTCCleared:
+                    let mins = Int.random(in: 0...6550)
+                    let A = mins / 256
+                    let B = mins % 256
+                    return "4E" + " " + String(format: "%02X", A) + " " + String(format: "%02X", B)
+                case .runTimeMIL:
+                    let mins = Int.random(in: 0...6550)
+                    let A = mins / 256
+                    let B = mins % 256
+                    return "4D" + " " + String(format: "%02X", A) + " " + String(format: "%02X", B)
                 case .hybridBatteryLife:
                     let life = Int.random(in: 100...65500)
                  

@@ -17,7 +17,10 @@ class BLEPeripheralManager: NSObject, ObservableObject {
     private let characteristicHandler: BLECharacteristicHandler
 
     weak var delegate: BLEPeripheralManagerDelegate?
-    private var connectionCompletion: ((CBPeripheral?, Error?) -> Void)?
+    // Resumed from the CB queue (characteristics ready/failed), reset() on an
+    // arbitrary thread, or the cancellation handler — take-once so those racing
+    // paths can never double-resume the waiting continuation.
+    private let setupCompletion = TakeOnceCompletion<CBPeripheral>()
 
     init(characteristicHandler: BLECharacteristicHandler) {
         self.characteristicHandler = characteristicHandler
@@ -34,18 +37,28 @@ class BLEPeripheralManager: NSObject, ObservableObject {
         }
     }
 
+    /// timeout may be .infinity (pending-connect mode: CoreBluetooth holds the
+    /// connect until the dongle appears, so cancellation is the only way out —
+    /// withTimeout runs the operation with no timeout child in that case).
     func waitForCharacteristicsSetup(timeout: TimeInterval) async throws {
         try await withTimeout(seconds: timeout) { [self] in
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                self.connectionCompletion = { peripheral, error in
-                    if peripheral != nil {
-                        continuation.resume()
-                    } else if let error = error {
-                        continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume(throwing: BLEManagerError.unknownError)
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    let claimed = setupCompletion.set { peripheral, error in
+                        if peripheral != nil {
+                            continuation.resume()
+                        } else if let error = error {
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume(throwing: BLEManagerError.unknownError)
+                        }
+                    }
+                    if !claimed {
+                        continuation.resume(throwing: BLEManagerError.connectionInProgress)
                     }
                 }
+            } onCancel: { [self] in
+                setupCompletion.take()?(nil, CancellationError())
             }
         }
     }
@@ -60,7 +73,7 @@ class BLEPeripheralManager: NSObject, ObservableObject {
     func didDiscoverCharacteristics(_ peripheral: CBPeripheral, service: CBService, error: Error?) {
         if let error = error {
             logger.error("Error discovering characteristics: \(error.localizedDescription)")
-            connectionCompletion?(nil, error)
+            setupCompletion.take()?(nil, error)
             return
         }
 
@@ -70,10 +83,13 @@ class BLEPeripheralManager: NSObject, ObservableObject {
 
         // Check if all required characteristics are set up
         if characteristicHandler.isReady {
-            connectionCompletion?(peripheral, nil)
-            connectionCompletion = nil
-
-            // Notify delegate
+            // Claim first: if the timeout/cancel/reset path already took the
+            // slot, this late success must not resume again — and must not
+            // announce .connectedToAdapter for a connection the caller has
+            // already torn down. Also swallows repeat isReady callbacks from
+            // additional services.
+            guard let completion = setupCompletion.take() else { return }
+            completion(peripheral, nil)
             delegate?.peripheralManager(self, didSetupCharacteristics: peripheral)
         }
     }
@@ -86,6 +102,12 @@ class BLEPeripheralManager: NSObject, ObservableObject {
 
         guard let data = characteristic.value else { return }
         characteristicHandler.handleUpdatedValue(data, from: characteristic)
+    }
+
+    func reset() {
+        connectedPeripheral?.delegate = nil
+        connectedPeripheral = nil
+        setupCompletion.take()?(nil, BLEManagerError.peripheralNotConnected)
     }
 }
 
